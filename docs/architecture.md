@@ -1,10 +1,11 @@
 # London Live 3D Map — Architecture Document
 
-> **Status:** Draft  
-> **Version:** 1.0  
+> **Status:** Revised (Post-Review Pass 1)  
+> **Version:** 2.0  
 > **Date:** 2026-06-18  
 > **Author:** Lead Architect  
-> **Audience:** Engineers implementing the system
+> **Audience:** Engineers implementing the system  
+> **Changes from v1:** All Critical and High severity issues from 3 independent reviews resolved. Major changes: Draco-compressed glTF buildings, backend aggregator with SSE, mutable refs for vehicle animation, entity resolution layer, unified transport schema, deployment strategy, inference engine re-scope.
 
 ---
 
@@ -39,39 +40,62 @@ Zone One is a real-time 3D visualization of London showing live transport across
 └────┬─────┘    └────┬─────┘    └────┬─────┘    └────┬─────┘
      │               │               │               │
      ▼               ▼               ▼               ▼
-┌────────────────────────────────────────────────────────────┐
-│                    Backend Proxy (Express)                  │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
-│  │  TfL     │  │ Darwin   │  │  ADSBx   │  │  AIS     │  │
-│  │ Fetcher  │  │ Fetcher  │  │ Fetcher  │  │ Fetcher  │  │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  │
-│       │              │              │              │       │
-│       └──────────────┴──────────────┴──────────────┘       │
-│                            │                                │
-│                   ┌────────▼────────┐                       │
-│                   │  In-Memory      │                       │
-│                   │  Cache (TTL)    │                       │
-│                   └────────┬────────┘                       │
-│                            │                                │
-│  GET /api/tube             │                                │
-│  GET /api/buses            │                                │
-│  GET /api/trains           │                                │
-│  GET /api/planes           │                                │
-│  GET /api/ships            │                                │
-│  GET /api/jamcams          │                                │
-│  GET /api/map/buildings    │                                │
-│  GET /api/map/geometry     │                                │
-└────────────────────────────┼────────────────────────────────┘
-                             │ fetch()
+┌─────────────────────────────────────────────────────────────────┐
+│                   Backend Aggregator (Express)                   │
+│                                                                  │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
+│  │  TfL     │  │ Darwin   │  │  ADSBx   │  │  AIS     │       │
+│  │ Adapter  │  │ Adapter  │  │ Adapter  │  │ Adapter  │       │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘       │
+│       │              │              │              │            │
+│       └──────────────┴──────────────┴──────────────┘            │
+│                            │                                    │
+│                   ┌────────▼────────┐                           │
+│                   │  Vehicle State  │                           │
+│                   │  Engine         │                           │
+│                   │  (tracking,     │                           │
+│                   │   inference,    │                           │
+│                   │   entity res.)  │                           │
+│                   └────────┬────────┘                           │
+│                            │                                    │
+│  ┌─────────────────────────▼────────────────────────────────┐  │
+│  │                    SSE Broadcast Channel                  │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  GET /api/sse/transport      (SSE stream — all vehicles)        │
+│  GET /api/sse/jamcams        (SSE stream — jamcams)            │
+│  GET /api/map/buildings      (static Draco glTF)                │
+│  GET /api/map/geometry       (static GeoJSON)                   │
+│  GET /api/search?q=...       (vehicle search)                   │
+│  GET /api/layers             (layer status + toggle)            │
+└─────────────────────────────────────────────────────────────────┘
+                             │ SSE / fetch()
                              ▼
-┌────────────────────────────────────────────────────────────┐
-│                    Frontend (Vite + React)                  │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
-│  │  Store   │  │  R3F     │  │  UI      │  │  Loading │  │
-│  │  (Zustand)│ │  Scene   │  │  Overlay │  │  Screen  │  │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘  │
-└────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                    Frontend (Vite + React)                       │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Mutable Refs (simulation state) ← NOT Zustand            │   │
+│  │  - vehicles: MutableVehicle[] (updated each frame)        │   │
+│  │  - No React re-render on position changes                 │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│           │                              │                       │
+│  ┌────────▼──────────┐      ┌───────────▼──────────┐           │
+│  │  R3F 3D Scene     │      │  UI Overlay (HTML)   │           │
+│  │  - Buildings      │      │  - Loading screen    │           │
+│  │  - Thames water   │      │  - Tooltips          │           │
+│  │  - Neon lines     │      │  - Jamcam overlay    │           │
+│  │  - Vehicle markers│      │  - Layer toggles     │           │
+│  │  - Street lamps   │      │  - Search/filter     │           │
+│  └───────────────────┘      └──────────────────────┘           │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+**Key changes from v1:**
+- Backend is an **Aggregator**, not a proxy. It polls APIs on its own schedule, maintains vehicle state, and broadcasts via SSE.
+- Frontend receives **render-ready snapshots** — no position calculation on the client.
+- Vehicle positions stored in **mutable refs**, not Zustand. React only re-renders for UI state (tooltips, layer toggles, search results).
+- Buildings delivered as **Draco-compressed glTF**, not GeoJSON.
 
 ---
 
@@ -79,37 +103,41 @@ Zone One is a real-time 3D visualization of London showing live transport across
 
 ### 2.1 Key Principles
 
-1. **Dummy-first development** — All data endpoints serve realistic dummy data during development. Real API integration is a drop-in replacement at the end. This de-risks the entire project by allowing visual iteration without API keys or rate limits.
+1. **Dummy-first development** — All data endpoints serve realistic dummy data during development. Real API integration is a drop-in replacement at the end.
 
-2. **Geometry-constrained animation** — Vehicles never move through free space. Bus and train positions are always projected onto the nearest point of the road/rail geometry array. This guarantees visual correctness (no flying over buildings).
+2. **Geometry-constrained animation** — Vehicles never move through free space. Bus and train positions are always projected onto the nearest point of the road/rail geometry array.
 
-3. **Instanced rendering** — All vehicles of the same type share a single `InstancedMesh`. This reduces draw calls from O(n) to O(1) per transport type. Buildings are merged by height tier into 4 instanced meshes.
+3. **Instanced rendering** — All vehicles of the same type share a single `InstancedMesh`. Buildings are Draco-compressed glTF loaded via `useGLTF` from Drei.
 
-4. **Single source of truth** — The Zustand store is the canonical state. No component holds local vehicle data. Components subscribe to store slices via `useStore(selector)`.
+4. **Simulation state on refs** — Vehicle positions are stored in mutable refs, NOT in React state. The renderer reads refs directly in `useFrame`. React only re-renders for UI interactions (hover, click, filter).
 
-5. **Polling over WebSockets** — All external data uses HTTP polling with configurable intervals. No WebSocket connections, no Server-Sent Events. This matches the APIs' design and keeps the architecture simple.
+5. **Backend aggregation, not proxy** — The backend polls APIs on its own schedule, maintains the canonical vehicle state, and broadcasts to all clients. One poll serves all users.
 
-6. **Frustum culling with margin** — Only render elements within the camera's frustum plus a 20% margin. This creates the illusion of instant loading while keeping GPU load low.
+6. **SSE for real-time updates** — Server-Sent Events push vehicle snapshots to the frontend. The frontend never polls the backend.
+
+7. **Draco-compressed glTF for buildings** — Overture tiles are converted to a single Draco-compressed glTF at build time. Target <50MB compressed.
+
+8. **Frustum culling with margin** — Only render elements within the camera's frustum plus a 20% margin.
 
 ### 2.2 Constraints
 
-- **Rate limits are hard boundaries.** The proxy server never exceeds the allowed request rate for any external API.
-- **Greater London bounding box is fixed.** lat 51.2–51.7, lon -0.5–0.3. No dynamic region selection.
+- **Rate limits are hard boundaries.** The backend never exceeds the allowed request rate for any external API.
+- **Greater London bounding box is fixed.** lat 51.2–51.7, lon -0.5–0.3.
 - **Desktop-first.** Mobile support is out of scope for V1.
-- **No persistent storage.** All data is in-memory. No IndexedDB, no localStorage for transport data.
-- **Single deployment target.** The app runs as a static frontend + a lightweight Express server. No container orchestration, no microservices.
+- **No persistent storage.** All data is in-memory.
+- **Single deployment target.** Static frontend + Express server.
 
 ### 2.3 Non-Goals (V1)
 
-- Mobile support (touch controls, responsive layout)
-- Performance settings menu (low/medium/high quality)
+- Mobile support
+- Performance settings menu
 - Keyboard shortcuts
-- Accessibility (screen reader, keyboard navigation)
-- LOD (Level of Detail) for buildings
+- Accessibility
+- LOD for buildings (frustum culling only)
 - Multi-city support
 - Historical data playback
 - Social sharing / export
-- WebSocket or real-time push
+- WebSocket (SSE is sufficient)
 
 ---
 
@@ -120,10 +148,10 @@ Zone One is a real-time 3D visualization of London showing live transport across
 **Responsibilities:**
 - Render the 3D scene (buildings, terrain, transport layers)
 - Manage camera controls (orbit, zoom, pan, presets)
-- Handle user interactions (hover, click, layer toggles)
+- Handle user interactions (hover, click, layer toggles, search)
 - Display UI overlays (loading screen, tooltips, jamcam, layer toggles)
-- Coordinate data fetching via backend API proxy
-- Manage application state via Zustand
+- Receive vehicle snapshots via SSE
+- Manage UI state (selected vehicle, hovered vehicle, visible layers, search query)
 
 **Components:**
 
@@ -133,127 +161,145 @@ App (root)
 ├── SceneProvider (R3F Canvas + PostProcessing)
 │   ├── OrbitControls (damping, auto-rotate)
 │   ├── AmbientLight + DirectionalLight
-│   ├── UnrealBloomPass (strength 1.5, radius 0.4, threshold 0.6)
-│   ├── GroundPlane (Y=0, dark surface)
-│   ├── ThamesWater (Y=-0.5, dark blue surface)
-│   ├── Buildings (4 instanced meshes by height tier)
-│   ├── Roads (grey line segments)
+│   ├── UnrealBloomPass
+│   ├── useGLTF (Draco buildings)
+│   ├── GroundPlane (Y=0)
+│   ├── ThamesWater (Y=-0.5, animated)
+│   ├── Roads (LineSegments)
 │   ├── TubeLines (13 colored neon lines + animated dots)
-│   ├── BusMarkers (red capsules on road geometry)
-│   ├── TrainMarkers (yellow dots on rail geometry)
-│   ├── PlaneMarkers (white capsules at altitude)
-│   ├── ShipMarkers (teal capsules on water)
-│   ├── RiverBoats (green dots on waterway)
-│   └── StreetLamps (yellow glow markers)
+│   ├── BusMarkers (InstancedMesh capsules)
+│   ├── TrainMarkers (InstancedMesh spheres)
+│   ├── PlaneMarkers (InstancedMesh capsules)
+│   ├── ShipMarkers (InstancedMesh capsules)
+│   ├── RiverBoats (InstancedMesh spheres)
+│   └── StreetLamps (InstancedMesh small boxes)
 ├── LayerToggles (top-right button group)
+├── SearchPanel (search bar + filter results)
 ├── Tooltip (appears on vehicle hover)
-└── JamcamOverlay (appears on signal hover)
+├── JamcamOverlay (appears on signal hover)
+└── AttributionFooter (bottom of screen)
 ```
 
-**State Management (Zustand):**
+**State Management (Zustand) — UI state only:**
 
 ```typescript
-interface Vehicle {
-  id: string;
-  type: VehicleType;
-  route: string;
-  registration?: string;
-  destination: string;
-  nextStops?: string[];
-  eta?: number;          // seconds to next stop
-  lat: number;
-  lng: number;
-  altitude?: number;     // meters (planes only)
-  speed?: number;        // knots (ships) or m/s (planes)
-  heading?: number;      // degrees
-  vertRate?: number;     // m/min (planes only)
-  delay?: number;        // seconds (trains only)
-  status?: 'on_time' | 'delayed' | 'cancelled';
-  timestamp: number;     // Unix epoch of data fetch
-}
-
-interface TransportData {
-  buses: Vehicle[];
-  tubes: Vehicle[];
-  trains: Vehicle[];
-  planes: Vehicle[];
-  ships: Vehicle[];
-  riverBoats: Vehicle[];
-  jamcams: Jamcam[];
-  lastUpdated: Record<VehicleType, number>;
-  loading: boolean;
-  error: string | null;
-  mapLoaded: boolean;
-}
-
-interface AppState extends TransportData {
-  selectedVehicle: Vehicle | null;
-  hoveredVehicle: Vehicle | null;
+// Zustand store holds ONLY UI state, NOT vehicle positions
+interface AppState {
+  // UI state
+  hoveredVehicle: VehicleSnapshot | null;
+  selectedVehicle: VehicleSnapshot | null;
   hoveredSignal: Signal | null;
   visibleLayers: Set<VehicleType>;
+  searchQuery: string;
+  searchResults: VehicleSnapshot[];
   cameraPreset: 'default' | 'top-down' | 'close-up';
+  loading: boolean;
+  error: string | null;
+  layerStatus: Record<VehicleType, 'ok' | 'stale' | 'error'>;
+
+  // UI actions only
+  setHoveredVehicle: (v: VehicleSnapshot | null) => void;
+  setSelectedVehicle: (v: VehicleSnapshot | null) => void;
+  toggleLayer: (type: VehicleType) => void;
+  setSearchQuery: (q: string) => void;
+  setCameraPreset: (p: AppState['cameraPreset']) => void;
 }
+```
+
+**Simulation State (mutable refs — NOT in Zustand):**
+
+```typescript
+// In Scene.tsx — accessible via useFrame, NOT React state
+const vehiclesRef = useRef<VehicleSnapshot[]>([]);
+const buildingsRef = useRef<GLTF | null>(null);
 ```
 
 **Rendering Architecture:**
 - `@react-three/fiber` Canvas is the root of all 3D rendering
-- All scene objects are React components that declaratively describe the Three.js scene graph
-- `requestAnimationFrame` drives the animation loop via R3F's `useFrame` hook
-- Post-processing (bloom) is applied as a full-screen pass after the scene renders
+- `useFrame` reads from mutable refs directly — no React re-render triggered
+- SSE listener updates the refs — no React re-render triggered
+- Only UI state changes (hover, click, search) trigger React re-renders
 
 ### 3.2 Backend Architecture
 
 **Responsibilities:**
-- Proxy requests to external APIs (TfL, Darwin, ADSBx, AIS Hub)
-- Serve static map data (GeoJSON files)
-- Serve dummy data during development
+- Poll external APIs on its own schedule (not per-client)
+- Normalize responses into a unified transport schema
+- Track vehicle identity across polling cycles (entity resolution)
+- Run inference engine (bus/train position calculation)
+- Maintain canonical vehicle state
+- Broadcast vehicle snapshots to all connected clients via SSE
+- Serve static map data (Draco glTF + geometry GeoJSON)
 - Enforce rate limits per data source
-- Cache responses in memory with TTL
-- Normalize external API responses into a consistent internal format
+- Handle errors gracefully (circuit breakers, retries)
 
-**API Proxy Design:**
-
-The proxy server uses Express with route handlers per data type. Each handler follows this pattern:
+**Aggregator Design:**
 
 ```
-Request → Check Cache → (if stale) → Fetch External API → Normalize → Cache → Response
+┌────────────────────────────────────────────────────────────┐
+│                   Backend Aggregator                        │
+│                                                            │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
+│  │  TfL     │  │ Darwin   │  │  ADSBx   │  │  AIS     │  │
+│  │ Adapter  │  │ Adapter  │  │ Adapter  │  │ Adapter  │  │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  │
+│       │              │              │              │       │
+│       └──────────────┴──────────────┴──────────────┘       │
+│                            │                                │
+│                   ┌────────▼────────┐                       │
+│                   │  Normalizer     │                       │
+│                   │  (unified       │                       │
+│                   │   transport     │                       │
+│                   │   schema)       │                       │
+│                   └────────┬────────┘                       │
+│                            │                                │
+│                   ┌────────▼────────┐                       │
+│                   │  Vehicle State  │                       │
+│                   │  Engine         │                       │
+│                   │  - entity       │                       │
+│                   │    resolution   │                       │
+│                   │  - inference    │                       │
+│                   │    engine       │                       │
+│                   │  - heartbeat    │                       │
+│                   │    monitor      │                       │
+│                   └────────┬────────┘                       │
+│                            │                                │
+│                   ┌────────▼────────┐                       │
+│                   │  SSE Broadcast  │                       │
+│                   │  Channel        │                       │
+│                   └─────────────────┘                       │
+└────────────────────────────────────────────────────────────┘
 ```
 
-**Caching:**
-- In-memory `Map<string, CacheEntry>` where CacheEntry = `{ data, expiresAt, fetching }`
-- TTL per data type (configured in constants)
-- Stale-while-revalidate: if cache is expired but `fetching` is true, return stale data
-- Cache is cold-started on server boot (first request triggers fetch)
-
-**External API Integration:**
-- Each data source has a dedicated fetcher module (`src/data/fetchers/tfl.ts`, `darwin.ts`, `adsbx.ts`, `ais.ts`)
-- Fetchers return normalized data in the internal format
-- Fetchers handle auth (API keys, usernames) from `process.env`
-- Fetchers include error handling (network errors, HTTP errors, rate limits)
+**Key difference from v1:** The backend is NOT a proxy. It does NOT forward client requests to external APIs. Instead:
+1. Backend polls APIs on its own schedule (one poll = all clients)
+2. Backend maintains the canonical vehicle state
+3. Backend broadcasts snapshots via SSE to all connected clients
+4. If 1 user or 1000 users connect, the backend still only polls once
 
 ### 3.3 Data Layer
 
 **Static Data:**
-- Overture buildings: Pre-processed GeoJSON in `public/map-data/buildings.geojson`
-- OSM geometry: Pre-processed GeoJSON in `public/map-data/geometry.geojson`
-- Loaded once at app startup, cached in Zustand store
-- Never re-fetched during runtime
+- Buildings: Draco-compressed glTF in `public/map-data/buildings.glb` (~50MB compressed)
+- Route geometry: GeoJSON in `public/map-data/geometry.geojson` (~50MB)
+- Loaded once at app startup
 
 **Real-Time Data:**
-- Transport data: Fetched from backend proxy at configured intervals
-- Jamcams: Fetched from TfL API at 60s interval
-- All real-time data flows through the cache layer
+- Transport data: Broadcast via SSE from backend
+- Jamcams: Broadcast via SSE from backend
+- All data flows through the Vehicle State Engine
 
 **Transformation Pipeline:**
 
 ```
 External API Response
-  → Fetcher (auth, HTTP request)
-  → Normalizer (field mapping, type conversion)
-  → Validator (lat/lng bounds, required fields)
-  → Cache (store with TTL)
-  → Store (Zustand state update)
-  → Renderer (Three.js mesh update)
+  → Adapter (auth, HTTP request, error handling)
+  → Normalizer (map to unified transport schema)
+  → Validator (lat/lng bounds, required fields, type checks)
+  → Entity Resolver (match to existing vehicle or create new)
+  → Inference Engine (calculate position for buses/trains)
+  → Heartbeat Monitor (flag stale entities)
+  → SSE Broadcast (push snapshot to all clients)
 ```
 
 ---
@@ -265,152 +311,180 @@ External API Response
 | Property | Value |
 |----------|-------|
 | **Responsibility** | Render the 3D scene using Three.js via React Three Fiber |
-| **Inputs** | Zustand store (vehicle positions, visible layers), camera position |
+| **Inputs** | Mutable refs (vehicle positions), camera position |
 | **Outputs** | Rendered WebGL canvas |
-| **Dependencies** | Three.js, @react-three/fiber, @react-three/drei, @react-three/postprocessing |
-| **Failure behavior** | If Three.js fails to initialize, show error overlay with message |
+| **Dependencies** | Three.js, @react-three/fiber, @react-three/drei, @react-three/postprocessing, draco3d |
+| **Failure behavior** | If Three.js fails, show error overlay with message |
 
-**Scene Graph:**
-```
-Canvas
-├── PerspectiveCamera (position, fov, controls)
-├── OrbitControls (damping: 0.05, autoRotate: false)
-├── AmbientLight (color: 0x404060, intensity: 0.3)
-├── DirectionalLight (color: 0xffeedd, intensity: 0.5)
-├── EffectComposer
-│   └── UnrealBloomPass (resolution: 256, strength: 1.5, radius: 0.4, threshold: 0.6)
-├── GroundPlane (Y=0, size: 40000x40000)
-├── ThamesWater (Y=-0.5, size: 30000x5000, animated)
-├── Buildings (4 InstancedMesh groups by height)
-├── Roads (LineSegments)
-├── TubeLines (13 LineSegments + 13 InstancedMesh dots)
-├── BusMarkers (InstancedMesh capsules)
-├── TrainMarkers (InstancedMesh spheres)
-├── PlaneMarkers (InstancedMesh capsules)
-├── ShipMarkers (InstancedMesh capsules)
-├── RiverBoats (InstancedMesh spheres)
-└── StreetLamps (InstancedMesh small boxes)
-```
+### 4.2 Vehicle State Engine (NEW — critical addition)
 
-### 4.2 Transport Layers
+| Property | Value |
+|----------|-------|
+| **Responsibility** | Maintain canonical vehicle state, track identity across polling cycles, run inference, broadcast snapshots |
+| **Inputs** | Normalized vehicle data from adapters |
+| **Outputs** | VehicleSnapshot[] broadcast via SSE |
+| **Dependencies** | Route geometry, inference engine, entity resolver |
+| **Failure behavior** | If engine crashes, SSE stops, frontend shows "data unavailable" |
+
+**Sub-components:**
+
+**Entity Resolver:**
+- Matches incoming vehicles to existing tracked vehicles using stable identifiers
+- For GPS data (planes, ships, GPS buses): match by `icao24` / `mmsi` / `registration`
+- For inferred data (trains, inferred buses): match by `route + direction + scheduled_time_window`
+- When a match is found, update position. When no match, create new entry. When a vehicle disappears for >2 polling cycles, mark as stale, then remove.
+
+**Inference Engine:**
+- Calculates position along route geometry for buses and trains
+- Receives: route geometry, ETA, current time
+- Outputs: { x, y, z, heading } in Three.js world coordinates
+- Runs on the backend (not frontend)
+
+**Heartbeat Monitor:**
+- Flags vehicles that haven't moved despite ETA changes
+- Logs warnings for stale entities
+- Helps debug inference accuracy
+
+### 4.3 Transport Layers (Frontend)
 
 Each transport layer follows the same pattern:
 
 | Property | Value |
 |----------|-------|
-| **Responsibility** | Render vehicles of one type, update positions each frame |
-| **Inputs** | Vehicle array from Zustand store, route geometry |
+| **Responsibility** | Render vehicles of one type, update positions from refs each frame |
+| **Inputs** | Mutable ref (vehicle snapshots), route geometry |
 | **Outputs** | Three.js mesh instances |
-| **Dependencies** | Store, geo utilities, inference engine |
+| **Dependencies** | Refs, geo utilities |
 | **Failure behavior** | Render empty layer (no vehicles visible) |
-
-**Per-layer specifics:**
-
-| Layer | Mesh Type | Color | Orientation | Elevation |
-|-------|-----------|-------|-------------|-----------|
-| Tube | InstancedMesh spheres | Line color | N/A (dots) | Y=0.3 (above ground) |
-| Bus | InstancedMesh capsules | Red | Forward along road | Y=0.1 (on road) |
-| Train | InstancedMesh spheres | Yellow | N/A (dots) | Y=0.3 (above ground) |
-| Plane | InstancedMesh capsules | White | By heading | Y=altitude (API) |
-| Ship | InstancedMesh capsules | Teal | By heading | Y=-0.5 (in river) |
-| River Boat | InstancedMesh spheres | Green | N/A (dots) | Y=-0.3 (on water) |
-
-### 4.3 Inference Engine
-
-| Property | Value |
-|----------|-------|
-| **Responsibility** | Calculate vehicle position along route geometry based on ETA and time elapsed |
-| **Inputs** | Route geometry (array of lat/lng points), ETA (seconds), current time |
-| **Outputs** | { lat, lng, heading } — position and orientation on the route |
-| **Dependencies** | geo.ts (coordinate conversion), constants.ts |
-| **Failure behavior** | Return last known position, log warning |
-
-**Algorithm:**
-```
-1. Given route geometry [p0, p1, p2, ..., pn]
-2. Calculate total route distance (sum of segment lengths)
-3. Calculate progress: progress = elapsed_time / total_time
-4. Find the segment where progress falls
-5. Interpolate within that segment
-6. Return position and heading (direction to next point)
-```
 
 ### 4.4 Map Data Pipeline
 
 | Property | Value |
 |----------|-------|
-| **Responsibility** | Load, transform, and serve map data (buildings + geometry) |
+| **Responsibility** | Download Overture tiles, convert to Draco-compressed glTF, serve to frontend |
 | **Inputs** | Overture Parquet tiles (downloaded), Overpass API response |
-| **Outputs** | GeoJSON FeatureCollections served to frontend |
-| **Dependencies** | parquetjs (Node.js), osmtogeojson (Node.js) |
-| **Failure behavior** | If tiles are missing, render empty scene (no buildings) |
+| **Outputs** | Draco-compressed glTF + GeoJSON served as static files |
+| **Dependencies** | draco3d, parquetjs (Node.js), osmtogeojson (Node.js) |
+| **Failure behavior** | If tiles missing, render empty scene (no buildings) |
 
-**Pipeline:**
+**Pipeline (changed from v1):**
 ```
-Overture S3 → Download Parquet tiles → Convert to GeoJSON → Save to public/map-data/
-Overpass API → Fetch geometry → Convert to GeoJSON → Save to public/map-data/
-Frontend → Load GeoJSON files → Parse → Build Three.js geometries
+Overture S3 → Download Parquet tiles → Convert to merged glTF with Draco compression → Save to public/map-data/buildings.glb
+Overpass API → Fetch geometry → Convert to GeoJSON → Save to public/map-data/geometry.geojson
+Frontend → Load glTF via useGLTF → Three.js renders buildings
 ```
 
-### 4.5 API Clients
+**Target: <50MB compressed glTF** (vs. 400-800MB GeoJSON in v1)
+
+### 4.5 API Adapters
 
 | Property | Value |
 |----------|-------|
-| **Responsibility** | Fetch data from external APIs, normalize responses |
-| **Inputs** | None (fetchers are stateless, called with parameters) |
-| **Outputs** | Normalized data in internal format |
+| **Responsibility** | Fetch data from external APIs, normalize to unified schema |
+| **Inputs** | None (stateless, called with parameters) |
+| **Outputs** | Normalized data in unified transport schema |
 | **Dependencies** | Node.js fetch, process.env for credentials |
-| **Failure behavior** | Return empty array, log error, cache layer returns stale data |
+| **Failure behavior** | Return empty array, log error, state engine marks layer as 'error' |
 
-**Per-client specifics:**
+**Unified Transport Schema (NEW — critical addition):**
 
-| Client | Endpoint | Auth | Normalization |
-|--------|----------|------|---------------|
-| TfL | Multiple endpoints | API key header | Map TfL fields → Vehicle interface |
-| Darwin | /departure-board/{code} | API key header | Map Darwin fields → Vehicle interface |
-| ADSBx | /area?lat=&lon=&rad= | x-api-key header | Map ADSBx fields → Vehicle interface |
-| AIS Hub | /ws.php?username=... | Username query param | Map AIS fields → Vehicle interface |
+All adapters output the same shape. The frontend never sees raw API responses.
 
-### 4.6 Cache Layer
-
-| Property | Value |
-|----------|-------|
-| **Responsibility** | Store fetched data with TTL, serve stale data while re-fetching |
-| **Inputs** | Key (data type), TTL (seconds) |
-| **Outputs** | Cached data or null |
-| **Dependencies** | None (pure in-memory Map) |
-| **Failure behavior** | Cache miss → fetch fresh data |
-
-**Cache entry structure:**
 ```typescript
-interface CacheEntry<T> {
-  data: T;
-  expiresAt: number;  // Unix timestamp
-  fetching: boolean;  // Is a fetch currently in progress?
+// Unified schema — consumed by both backend and frontend
+interface TransportEntity {
+  // Identity
+  entityId: string;       // Stable ID: icao24, mmsi, registration, or route+time
+  type: VehicleType;
+  route: string;
+  registration?: string;
+
+  // Position (Three.js world coordinates, NOT lat/lng)
+  x: number;              // Easting
+  y: number;              // Altitude/elevation
+  z: number;              // Northing
+  heading: number;        // Degrees
+
+  // Movement
+  speed?: number;
+  vertRate?: number;
+
+  // Metadata
+  destination: string;
+  nextStops?: string[];
+  eta?: number;
+  delay?: number;
+  status?: 'on_time' | 'delayed' | 'cancelled';
+  dataCertainty: 'gps' | 'inferred';  // NEW: visual distinction
+
+  // Source
+  sourceType: 'tfl' | 'darwin' | 'adsbx' | 'ais';
+  timestamp: number;      // Unix epoch
 }
 ```
 
-**TTL Configuration:**
+**Per-adapter specifics:**
+
+| Adapter | Endpoint | Auth | Normalization |
+|---------|----------|------|---------------|
+| TfL | Multiple | API key header | Map lineName, destination, minutesToStation → TransportEntity |
+| Darwin | /departure-board/{code} | API key header | Map TargetArrival, DestinationName → TransportEntity |
+| ADSBx | /area?lat=&lon=&rad= | x-api-key header | Map callsign, lat, lng, altitude, heading → TransportEntity |
+| AIS Hub | /ws.php?username=... | Username query param | Map NAME, MMSI, LATITUDE, LONGITUDE, SOG, HEADING → TransportEntity |
+
+### 4.6 SSE Broadcast Layer
+
+| Property | Value |
+|----------|-------|
+| **Responsibility** | Push vehicle snapshots to all connected clients |
+| **Inputs** | VehicleStateEngine output |
+| **Outputs** | SSE events to frontend |
+| **Dependencies** | Node.js SSE, VehicleStateEngine |
+| **Failure behavior** | If SSE fails, client reconnects automatically |
+
+**SSE Event Format:**
+
 ```typescript
-const CACHE_TTL: Record<VehicleType | 'jamcam', number> = {
-  tube: 30,
-  bus: 30,
-  train: 30,
-  plane: 10,
-  ship: 60,
-  riverBoat: 30,
-  jamcam: 60,
-};
+// Event: "vehicles"
+// Data: {
+//   type: "vehicles",
+//   snapshot: TransportEntity[]
+// }
+
+// Event: "jamcams"
+// Data: {
+//   type: "jamcams",
+//   snapshot: Jamcam[]
+// }
+
+// Event: "layer-status"
+// Data: {
+//   type: "layer-status",
+//   status: Record<VehicleType, 'ok' | 'stale' | 'error'>
+// }
 ```
+
+**Polling Schedule (backend-driven):**
+
+| Data Type | Poll Interval | SSE Broadcast |
+|-----------|--------------|---------------|
+| Tube | 30s | Every poll |
+| Bus | 30s | Every poll |
+| Train | 30s | Every poll |
+| Plane | 10s | Every poll |
+| Ship | 60s | Every poll |
+| River Boat | 30s | Every poll |
+| Jamcam | 60s | Every poll |
+| Layer Status | 30s | Every poll |
 
 ### 4.7 UI Layer
 
 | Property | Value |
 |----------|-------|
-| **Responsibility** | Render HTML overlays (loading screen, tooltips, jamcam, layer toggles) |
-| **Inputs** | Zustand store (hovered vehicle, hovered signal, loading state) |
+| **Responsibility** | Render HTML overlays, handle user interactions |
+| **Inputs** | Zustand store (UI state only), mutable refs (for rendering) |
 | **Outputs** | HTML elements overlaid on the 3D canvas |
-| **Dependencies** | Zustand store, Tooltip component, JamcamOverlay component |
+| **Dependencies** | Zustand store, component libraries |
 | **Failure behavior** | UI degrades gracefully (no tooltips, no overlays) |
 
 ---
@@ -419,130 +493,90 @@ const CACHE_TTL: Record<VehicleType | 'jamcam', number> = {
 
 ### 5.1 Domain Entities
 
-**Vehicle** (shared by all transport types):
+**TransportEntity** (unified schema, replaces per-type Vehicle):
 ```
-Vehicle
+TransportEntity
 ├── identity
-│   ├── id: string          // Unique identifier (route + index)
-│   ├── type: VehicleType   // 'tube' | 'bus' | 'train' | 'plane' | 'ship' | 'riverBoat'
-│   ├── route: string       // Route number/name (e.g., "N343", "Central", "BAW123")
-│   └── registration?: string  // Vehicle registration (buses, ships)
-├── position
-│   ├── lat: number         // Latitude (WGS84)
-│   ├── lng: number         // Longitude (WGS84)
-│   └── altitude?: number   // Altitude in meters (planes only)
+│   ├── entityId: string      // Stable ID (icao24, mmsi, registration, or route+time)
+│   ├── type: VehicleType     // 'tube' | 'bus' | 'train' | 'plane' | 'ship' | 'riverBoat'
+│   ├── route: string         // Route number/name
+│   └── registration?: string // Vehicle registration
+├── position (Three.js world coords)
+│   ├── x: number             // Easting (Web Mercator)
+│   ├── y: number             // Altitude/elevation
+│   ├── z: number             // Northing (Web Mercator)
+│   └── heading: number       // Degrees
 ├── movement
-│   ├── heading?: number    // Direction in degrees (0=N, 90=E)
-│   ├── speed?: number      // Speed (m/s for planes, knots for ships)
-│   └── vertRate?: number   // Vertical rate m/min (planes only)
+│   ├── speed?: number        // m/s (planes) or knots (ships)
+│   └── vertRate?: number     // m/min (planes only)
 ├── metadata
-│   ├── destination: string // Final destination
-│   ├── nextStops?: string[] // Upcoming stops/stations
-│   ├── eta?: number        // Seconds to next stop
-│   ├── delay?: number      // Seconds of delay (trains only)
-│   └── status?: string     // 'on_time' | 'delayed' | 'cancelled'
-└── timestamp
-    └── timestamp: number   // Unix epoch of data fetch
+│   ├── destination: string
+│   ├── nextStops?: string[]
+│   ├── eta?: number          // Seconds to next stop
+│   ├── delay?: number        // Seconds of delay
+│   ├── status?: string
+│   └── dataCertainty: 'gps' | 'inferred'  // NEW: visual distinction
+└── source
+    ├── sourceType: string    // 'tfl' | 'darwin' | 'adsbx' | 'ais'
+    └── timestamp: number     // Unix epoch
 ```
 
 **Jamcam:**
 ```
 Jamcam
-├── id: string              // TFL jamcam ID
-├── name: string            // Camera name (e.g., "Piccadilly Circus")
-├── lat: number             // Camera position
-├── lng: number             // Camera position
-├── available: boolean      // Is the camera working?
-├── imageUrl: string        // Static snapshot URL
-├── videoUrl: string        // Live video URL
-└── view: string            // Camera view description
+├── id: string
+├── name: string
+├── x: number             // Three.js world coords (converted from lat/lng)
+├── y: number
+├── z: number
+├── available: boolean
+├── imageUrl: string
+├── videoUrl: string
+└── view: string
 ```
 
 **Signal (Street Lamp):**
 ```
 Signal
-├── id: string              // Unique identifier (index-based)
-├── lat: number             // Position on road
-├── lng: number             // Position on road
-├── jamcamId?: string       // Associated jamcam ID (if any)
-└── roadSegment: string     // Road identifier
+├── id: string
+├── x: number
+├── y: number
+├── z: number
+├── jamcamId?: string
+└── roadSegment: string
 ```
 
 **RouteGeometry:**
 ```
 RouteGeometry
-├── id: string              // Route identifier
-├── type: GeometryType      // 'road' | 'rail' | 'waterway' | 'busRoute'
-├── name: string            // Route name
-└── points: GeoPoint[]      // Ordered array of {lat, lng}
+├── id: string
+├── type: GeometryType
+├── name: string
+└── points: { x: number; y: number; z: number }[]  // Already in Three.js world coords
 ```
 
-### 5.2 TypeScript Interfaces
-
-Full interfaces are defined in `src/store/types.ts`. Key interfaces:
-
-```typescript
-type VehicleType = 'tube' | 'bus' | 'train' | 'plane' | 'ship' | 'riverBoat';
-type GeometryType = 'road' | 'rail' | 'waterway' | 'busRoute';
-
-interface Vehicle { ... }  // See section 5.1
-interface Jamcam { ... }   // See section 5.1
-interface Signal { ... }   // See section 5.1
-interface RouteGeometry { ... }  // See section 5.1
-
-interface TransportData {
-  buses: Vehicle[];
-  tubes: Vehicle[];
-  trains: Vehicle[];
-  planes: Vehicle[];
-  ships: Vehicle[];
-  riverBoats: Vehicle[];
-  jamcams: Jamcam[];
-  lastUpdated: Record<VehicleType | 'jamcam', number>;
-  loading: boolean;
-  error: string | null;
-  mapLoaded: boolean;
-}
-
-interface AppState extends TransportData {
-  selectedVehicle: Vehicle | null;
-  hoveredVehicle: Vehicle | null;
-  hoveredSignal: Signal | null;
-  visibleLayers: Set<VehicleType>;
-  cameraPreset: 'default' | 'top-down' | 'close-up';
-}
-```
-
-### 5.3 Data Ownership
+### 5.2 Data Ownership
 
 | Data | Owned By | Updated By |
 |------|----------|------------|
-| Vehicles | Zustand store (frontend) | Backend proxy (via API) |
-| Map data | Zustand store (frontend) | Static files (pre-processed) |
-| Cache | Backend proxy (Express) | Proxy fetchers |
-| UI state | Zustand store (frontend) | User interaction |
+| Transport entities | Backend VehicleStateEngine | Backend adapters (polling) |
+| Map data | Frontend (static files) | Build scripts (pre-processed) |
+| UI state | Frontend Zustand | User interaction |
 
-### 5.4 Data Lifecycle
+### 5.3 Data Lifecycle
 
 ```
-1. Server boot → Load static map data from files
+1. Server boot → Load static map data (glTF + geometry)
 2. Server boot → Start polling timers per data type
-3. Poll timer fires → Check cache → Fetch if stale → Normalize → Cache → Proxy → Frontend
-4. Frontend receives data → Update Zustand store → R3F re-renders
-5. R3F useFrame → Update vehicle positions → GPU renders
+3. Poll timer fires → Fetch external API → Normalize → Entity Resolve → Inference → Heartbeat
+4. VehicleStateEngine → SSE Broadcast → All clients
+5. Client SSE listener → Update mutable refs → useFrame reads refs → GPU renders
+6. React only re-renders for UI state changes (hover, click, search, layer toggle)
 ```
 
-### 5.5 Update Frequency
+### 5.4 Update Frequency
 
-| Data Type | Poll Interval | TTL | Notes |
-|-----------|--------------|-----|-------|
-| Tube | 30s | 30s | Burst arrivals at stations |
-| Bus | 30s | 30s | Mix of GPS + inferred |
-| Train | 30s | 30s | Inferred from departures |
-| Plane | 10s | 10s | Max allowed by ADSBx |
-| Ship | 60s | 60s | Max allowed by AIS Hub |
-| River Boat | 30s | 30s | Inferred from arrivals |
-| Jamcam | 60s | 60s | Static data |
+Same as v1. Backend polls on its schedule, broadcasts to all clients.
 
 ---
 
@@ -552,94 +586,87 @@ interface AppState extends TransportData {
 
 ```
 TfL API /Metro/Live/Arrivals/{stationId}
-  → Backend TfL Fetcher (auth: API key)
-  → Normalizer (map lineName, destination, minutesToStation → Vehicle[])
-  → Validator (check lat/lng bounds)
-  → Cache (TTL: 30s)
-  → Proxy GET /api/tube/arrivals
-  → Frontend fetch()
-  → Zustand store.tubes update
-  → TubeLines component re-renders
-  → useFrame updates dot positions along line geometry
-  → GPU renders neon line + moving dots
+  → TfL Adapter (auth: API key)
+  → Normalizer (map to unified TransportEntity)
+  → Validator (lat/lng bounds, required fields)
+  → Entity Resolver (match to existing tube entity or create new)
+  → Inference Engine (calculate x,y,z on line geometry from ETA)
+  → Heartbeat Monitor (check for stale entities)
+  → VehicleStateEngine (update canonical state)
+  → SSE Broadcast (push snapshot to all clients)
+  → Client SSE listener → Update mutable refs
+  → useFrame reads refs → GPU renders neon line + moving dots
 ```
 
 ### 6.2 Bus Data Flow
 
 ```
 TfL API /Bus/RealTime + /Metro/Live/Arrivals/{stationId}
-  → Backend TfL Fetcher (auth: API key)
-  → Normalizer (GPS buses: direct position; inferred: calculate from ETA + route geometry)
+  → TfL Adapter (auth: API key)
+  → Normalizer (GPS buses: direct position; inferred: mark as 'inferred')
   → Validator (check lat/lng, snap to road geometry)
-  → Cache (TTL: 30s)
-  → Proxy GET /api/buses
-  → Frontend fetch()
-  → Zustand store.buses update
-  → BusMarkers component re-renders
-  → useFrame updates capsule positions along road geometry
-  → GPU renders red capsules on roads
+  → Entity Resolver (match by registration for GPS, route+time for inferred)
+  → Inference Engine (calculate x,y,z along road geometry)
+  → Heartbeat Monitor
+  → VehicleStateEngine
+  → SSE Broadcast
+  → Client SSE → mutable refs → useFrame → GPU renders red capsules
 ```
 
 ### 6.3 Train Data Flow
 
 ```
 Darwin DBRS /departure-board/{NaptocCode}
-  → Backend Darwin Fetcher (auth: API key)
-  → Normalizer (map TargetArrival, ExpectedArrival, DestinationName → Vehicle[])
+  → Darwin Adapter (auth: API key)
+  → Normalizer (map to unified TransportEntity)
   → Validator (check lat/lng, snap to rail geometry)
-  → Cache (TTL: 30s)
-  → Proxy GET /api/trains
-  → Frontend fetch()
-  → Zustand store.trains update
-  → TrainMarkers component re-renders
-  → useFrame updates dot positions along rail geometry
-  → GPU renders yellow dots on rails
+  → Entity Resolver (match by route + direction + scheduled_time_window)
+  → Inference Engine (calculate x,y,z along rail geometry)
+  → Heartbeat Monitor
+  → VehicleStateEngine
+  → SSE Broadcast
+  → Client SSE → mutable refs → useFrame → GPU renders yellow dots
 ```
 
 ### 6.4 Plane Data Flow
 
 ```
 ADSBx v2 /area?lat=51.5&lon=-0.1&rad=25
-  → Backend ADSBx Fetcher (auth: x-api-key header, Accept-Encoding: gzip)
-  → Normalizer (map callsign, lat, lng, baro_altitude, true_track, speed_ground → Vehicle[])
+  → ADSBx Adapter (auth: x-api-key, Accept-Encoding: gzip)
+  → Normalizer (map to unified TransportEntity, dataCertainty: 'gps')
   → Validator (check lat/lng, altitude > 0, is_on_ground === false)
-  → Cache (TTL: 10s)
-  → Proxy GET /api/planes
-  → Frontend fetch()
-  → Zustand store.planes update
-  → PlaneMarkers component re-renders
-  → useFrame updates capsule positions (velocity * dt)
-  → GPU renders white capsules at altitude
+  → Entity Resolver (match by icao24)
+  → Inference Engine (not needed — GPS data, direct position)
+  → Heartbeat Monitor
+  → VehicleStateEngine
+  → SSE Broadcast
+  → Client SSE → mutable refs → useFrame → GPU renders white capsules
 ```
 
 ### 6.5 Ship Data Flow
 
 ```
 AIS Hub /ws.php?username=...&latmin=...&latmax=...&lonmin=...&lonmax=...
-  → Backend AIS Fetcher (auth: username query param)
-  → Normalizer (map NAME, MMSI, LATITUDE, LONGITUDE, SOG, HEADING → Vehicle[])
+  → AIS Adapter (auth: username query param)
+  → Normalizer (map to unified TransportEntity, dataCertainty: 'gps')
   → Validator (check lat/lng, SOG >= 0, HEADING 0-360)
-  → Cache (TTL: 60s)
-  → Proxy GET /api/ships
-  → Frontend fetch()
-  → Zustand store.ships update
-  → ShipMarkers component re-renders
-  → useFrame updates capsule positions (SOG * dt)
-  → GPU renders teal capsules on water
+  → Entity Resolver (match by MMSI)
+  → Inference Engine (not needed — GPS data, direct position)
+  → Heartbeat Monitor
+  → VehicleStateEngine
+  → SSE Broadcast
+  → Client SSE → mutable refs → useFrame → GPU renders teal capsules
 ```
 
 ### 6.6 Jamcam Data Flow
 
 ```
 TfL API /Place/Type/JamCam
-  → Backend TfL Fetcher (auth: API key)
-  → Normalizer (map commonName, lat, lon, imageUrl, videoUrl → Jamcam[])
+  → TfL Adapter (auth: API key)
+  → Normalizer (map to Jamcam[], convert lat/lng to Three.js world coords)
   → Validator (check lat/lng, available === true)
-  → Cache (TTL: 60s)
-  → Proxy GET /api/jamcams
-  → Frontend fetch()
-  → Zustand store.jamcams update
-  → StreetLamps component assigns nearest jamcam to each lamp
+  → SSE Broadcast
+  → Client SSE → mutable refs → StreetLamps component assigns nearest jamcam
   → Hover on signal → JamcamOverlay shows imageUrl/videoUrl
 ```
 
@@ -657,16 +684,16 @@ Scene
 │   └── DirectionalLight (0xffeedd, intensity: 0.5, castShadow: true)
 ├── Post-processing:
 │   └── EffectComposer + UnrealBloomPass
-├── Geometry (static):
+├── Geometry (static, loaded once):
+│   ├── Buildings (Draco-compressed glTF, loaded via useGLTF)
 │   ├── GroundPlane (PlaneGeometry, Y=0)
 │   ├── ThamesWater (PlaneGeometry, Y=-0.5, animated)
 │   ├── Roads (LineSegments from OSM geometry)
 │   ├── TubeLines (13 LineSegments, one per line)
 │   ├── RailLines (LineSegments from OSM geometry)
-│   ├── Waterway (LineSegments for Thames)
-│   └── StreetLamps (InstancedMesh, ~500 instances)
-├── Geometry (dynamic, updated each frame):
-│   ├── Buildings (4 InstancedMesh, grouped by height tier)
+│   └── Waterway (LineSegments for Thames)
+├── Geometry (dynamic, updated each frame from refs):
+│   ├── StreetLamps (InstancedMesh, ~500 instances)
 │   ├── TubeDots (InstancedMesh, ~200 instances)
 │   ├── BusMarkers (InstancedMesh, ~800 instances)
 │   ├── TrainDots (InstancedMesh, ~100 instances)
@@ -679,7 +706,7 @@ Scene
 
 ```tsx
 <Canvas gl={{ antialias: true, alpha: false, powerPreference: 'high-performance' }}
-        dpr={[1, 2]}  // Cap at 2x
+        dpr={[1, 2]}
         camera={{ position: [0, 2000, 2000], fov: 60 }}>
   <OrbitControls enableDamping dampingFactor={0.05} autoRotate={false} />
   <ambientLight intensity={0.3} color={0x404060} />
@@ -695,26 +722,23 @@ Scene
 ### 7.3 Instancing Strategy
 
 **Buildings:**
-- Group by height tier: [0-10m], [10-30m], [30-60m], [60m+]
-- Each group becomes one `InstancedMesh`
-- ~4 instanced meshes total for all 50k-100k buildings
+- Draco-compressed glTF loaded via `useGLTF` from Drei
+- Single file, ~50MB compressed
+- Three.js handles LOD and frustum culling internally
+- No manual instancing needed for buildings
 
 **Vehicles:**
 - One `InstancedMesh` per transport type
 - ~6 instanced meshes total for all vehicles
 - Each instance has its own transform matrix (position + rotation) and color
 
-**Total draw calls:** ~212 (4 buildings + 6 vehicles + ~200 lines/roads/lamps)
+**Total draw calls:** ~210 (buildings ~10-20 via glTF + 6 vehicles + ~200 lines/roads/lamps)
 
 ### 7.4 LOD Strategy
 
-**V1 (current):** No LOD. All geometry is rendered at full detail. Frustum culling ensures only visible elements are drawn.
+**V1:** Frustum culling only. Three.js handles this automatically for glTF models. No manual LOD.
 
-**Future enhancement:** Implement LOD for buildings:
-- LOD 0 (close): Full building geometry with edges
-- LOD 1 (medium): Simplified box
-- LOD 2 (far): Silhouette only
-- LOD 3 (very far): Not rendered
+**Future enhancement:** If VRAM becomes an issue, implement distance-based building simplification.
 
 ### 7.5 Coordinate System
 
@@ -730,35 +754,50 @@ Scene
 
 ### 7.6 Animation Loop
 
-All animation happens in R3F's `useFrame` hook:
+All animation happens in R3F's `useFrame` hook. **No React re-render is triggered:**
 
 ```typescript
-useFrame(({ clock }) => {
+// In Scene.tsx — reads from mutable refs, NOT Zustand
+useFrame(() => {
   const delta = clock.getDelta();
-  const elapsed = clock.getElapsedTime();
 
-  // Update bus positions along road geometry
-  buses.forEach(bus => {
-    bus.position = interpolateAlongGeometry(bus.routeGeometry, bus.eta, elapsed);
-    bus.rotation.y = calculateHeading(bus.routeGeometry, bus.position);
+  // Read vehicle positions from refs (no React re-render)
+  const vehicles = vehiclesRef.current;
+
+  // Update instance matrices directly
+  vehicles.forEach((vehicle, i) => {
+    const mesh = vehicleMeshesRef.current[vehicle.type];
+    if (!mesh) return;
+
+    const matrix = new THREE.Matrix4();
+    matrix.setPosition(vehicle.x, vehicle.y, vehicle.z);
+    matrix.makeRotationY(vehicle.heading * Math.PI / 180);
+    mesh.setMatrixAt(i, matrix);
   });
 
-  // Update train positions along rail geometry
-  trains.forEach(train => { ... });
-
-  // Update plane positions (velocity-based)
-  planes.forEach(plane => {
-    plane.position.x += plane.speed * Math.cos(plane.heading) * delta;
-    plane.position.z += plane.speed * Math.sin(plane.heading) * delta;
-    plane.position.y = plane.altitude;
+  // Mark instances for update
+  vehiclesRef.current.forEach(v => {
+    const mesh = vehicleMeshesRef.current[v.type];
+    if (mesh) mesh.instanceMatrix.needsUpdate = true;
   });
-
-  // Update ship positions (speed-based)
-  ships.forEach(ship => { ... });
-
-  // Update instance matrices
-  updateInstancedMeshes();
 });
+```
+
+**SSE listener updates refs (no React re-render):**
+
+```typescript
+// In Scene.tsx — SSE listener
+useEffect(() => {
+  const eventSource = new EventSource('/api/sse/transport');
+  eventSource.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    if (data.type === 'vehicles') {
+      // Update mutable refs directly — NO React re-render
+      vehiclesRef.current = data.snapshot;
+    }
+  };
+  return () => eventSource.close();
+}, []);
 ```
 
 ---
@@ -768,21 +807,20 @@ useFrame(({ clock }) => {
 ### 8.1 Routes
 
 ```typescript
-// server/proxy.ts
+// server/routes.ts
 const router = express.Router();
 
-// Transport data
-router.get('/api/tube/arrivals', tflController.getTubeArrivals);
-router.get('/api/buses', tflController.getBuses);
-router.get('/api/trains', darwinController.getTrains);
-router.get('/api/planes', adsbxController.getPlanes);
-router.get('/api/ships', aisController.getShips);
-router.get('/api/river-boats', tflController.getRiverBoats);
-router.get('/api/jamcams', tflController.getJamcams);
+// SSE streams (long-lived connections)
+router.get('/api/sse/transport', sseController.transportStream);
+router.get('/api/sse/jamcams', sseController.jamcamStream);
+router.get('/api/sse/layer-status', sseController.layerStatusStream);
 
-// Map data (served from static files)
-router.get('/api/map/buildings', mapController.getBuildings);
-router.get('/api/map/geometry', mapController.getGeometry);
+// Static map data
+router.get('/api/map/buildings', (req, res) => res.sendFile('buildings.glb'));
+router.get('/api/map/geometry', (req, res) => res.sendFile('geometry.geojson'));
+
+// Search
+router.get('/api/search', searchController.search);
 
 // Health check
 router.get('/api/health', (req, res) => res.json({ status: 'ok' }));
@@ -792,72 +830,73 @@ router.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
 | Service | File | Responsibility |
 |---------|------|----------------|
-| TfLController | `server/proxy/tfl.ts` | Tube, bus, river, jamcam data |
-| DarwinController | `server/proxy/darwin.ts` | National rail data |
-| ADSBxController | `server/proxy/adsbx.ts` | Aircraft data |
-| AISController | `server/proxy/ais.ts` | Vessel data |
-| MapController | `server/proxy/map.ts` | Static map data |
-| Cache | `server/cache.ts` | In-memory TTL cache |
-| RateLimiter | `server/rateLimiter.ts` | Token bucket rate limiter |
+| Adapters | `server/adapters/tfl.ts`, `darwin.ts`, `adsbx.ts`, `ais.ts` | Fetch + normalize from external APIs |
+| Normalizer | `server/normalizer/transport.ts` | Map to unified TransportEntity schema |
+| EntityResolver | `server/tracking/entityResolver.ts` | Match incoming vehicles to existing entities |
+| InferenceEngine | `server/inference/bus.ts`, `train.ts` | Calculate position along geometry |
+| HeartbeatMonitor | `server/tracking/heartbeat.ts` | Flag stale entities |
+| VehicleStateEngine | `server/tracking/vehicleStateEngine.ts` | Maintain canonical state, coordinate all components |
+| SSEController | `server/sse/controller.ts` | Manage SSE connections, broadcast snapshots |
+| MapController | `server/controllers/map.ts` | Serve static map files |
+| SearchController | `server/controllers/search.ts` | Search/filter vehicles |
 
-### 8.3 Cache Strategy
+### 8.3 Cache / State Strategy
+
+The backend does NOT use a traditional cache. Instead, it uses a **Vehicle State Engine** that maintains the canonical state:
 
 ```typescript
-// server/cache.ts
-class Cache {
-  private store = new Map<string, CacheEntry>();
+// server/tracking/vehicleStateEngine.ts
+class VehicleStateEngine {
+  // Map<entityId, TransportEntity>
+  private vehicles = new Map<string, TransportEntity>();
 
-  get<T>(key: string): T | null {
-    const entry = this.store.get(key);
-    if (!entry) return null;
-    if (entry.expiresAt < Date.now()) {
-      // Stale but fetching in progress
-      if (entry.fetching) return entry.data;
-      // Stale and not fetching, remove
-      this.store.delete(key);
-      return null;
-    }
-    return entry.data as T;
-  }
+  // Polling schedule
+  private pollingSchedule: Record<VehicleType, number> = {
+    tube: 30000,
+    bus: 30000,
+    train: 30000,
+    plane: 10000,
+    ship: 60000,
+    riverBoat: 30000,
+  };
 
-  set<T>(key: string, data: T, ttl: number): void {
-    this.store.set(key, {
-      data,
-      expiresAt: Date.now() + ttl * 1000,
-      fetching: false,
+  // Heartbeat timeout (seconds before marking stale)
+  private heartbeatTimeout = 90;
+
+  // SSE subscribers
+  private subscribers: Set<Response> = new Set();
+
+  // Poll all sources on their schedule
+  start(): void {
+    Object.entries(this.pollingSchedule).forEach(([type, interval]) => {
+      setInterval(() => this.poll(type), interval);
     });
   }
 
-  async getOrFetch<T>(key: string, fetchFn: () => Promise<T>, ttl: number): Promise<T> {
-    // Check cache first
-    const cached = this.get<T>(key);
-    if (cached) return cached;
-
-    // Check if fetch is in progress
-    const entry = this.store.get(key);
-    if (entry?.fetching) {
-      // Wait for existing fetch to complete
-      return new Promise<T>((resolve) => {
-        const check = setInterval(() => {
-          const e = this.store.get(key);
-          if (e && !e.fetching) {
-            clearInterval(check);
-            resolve(e.data as T);
-          }
-        }, 100);
-      });
-    }
-
-    // Start new fetch
-    this.store.set(key, { data: null as any, expiresAt: 0, fetching: true });
+  // Poll a specific transport type
+  async poll(type: VehicleType): Promise<void> {
     try {
-      const data = await fetchFn();
-      this.set(key, data, ttl);
-      return data;
+      const rawData = await this.fetch(type);       // Adapter
+      const normalized = this.normalize(rawData);    // Normalizer
+      const resolved = this.resolve(normalized);     // Entity Resolver
+      const inferred = this.infer(resolved);         // Inference Engine
+      this.heartbeat(inferred);                      // Heartbeat Monitor
+      this.broadcast(inferred);                      // SSE Broadcast
     } catch (err) {
-      this.store.delete(key);
-      throw err;
+      this.handlePollError(type, err);               // Circuit breaker
     }
+  }
+
+  // Register SSE subscriber
+  subscribe(res: Response): void {
+    this.subscribers.add(res);
+    res.on('close', () => this.subscribers.delete(res));
+  }
+
+  // Broadcast to all SSE subscribers
+  private broadcast(entities: TransportEntity[]): void {
+    const payload = JSON.stringify({ type: 'vehicles', snapshot: entities });
+    this.subscribers.forEach(sub => sub.write(`data: ${payload}\n\n`));
   }
 }
 ```
@@ -866,18 +905,20 @@ class Cache {
 
 | Error Type | Handling |
 |------------|----------|
-| Network timeout | Retry once after 2s, then return empty array |
+| Network timeout | Retry once after 2s, then mark layer as 'error' in layer status |
 | HTTP 429 (rate limit) | Wait for rate limit window, retry once |
-| HTTP 5xx | Retry once after 1s, then return empty array |
-| Invalid response | Log error, return empty array |
+| HTTP 5xx | Retry once after 1s, then mark layer as 'error' |
+| Invalid response | Log error, skip that vehicle, continue with others |
 | Missing required fields | Log warning, skip that vehicle |
 | Coordinates out of bounds | Log warning, skip that vehicle |
+
+**Circuit Breaker:** If an adapter fails 3 consecutive polls, mark the layer as 'error' and stop polling for 60s. After 60s, retry once.
 
 ### 8.5 Retries
 
 - **Max retries:** 1 per request
 - **Retry delay:** 1s for 5xx, 2s for network timeout
-- **No exponential backoff** (simple linear retry is sufficient for this scale)
+- **No exponential backoff**
 
 ### 8.6 Rate Limiting
 
@@ -925,43 +966,35 @@ class RateLimiter {
 Terminal session:
   npm run dev
     ├── vite (port 5173) — Frontend dev server with HMR
-    └── node server/index.ts (port 3001) — Backend proxy server
+    └── node server/index.ts (port 3001) — Backend aggregator
 
 Vite config proxy:
-  server.proxy['/api'] = 'http://localhost:3001'
+  server.proxy['/api/sse'] = 'http://localhost:3001'
+  server.proxy['/api/map'] = 'http://localhost:3001'
 
 Environment:
   .env.local — API keys (gitignored)
   .env.example — Template (committed)
 ```
 
-**Dependencies:**
-```json
-{
-  "devDependencies": {
-    "concurrently": "^9.0.0"
-  },
-  "scripts": {
-    "dev": "concurrently \"npm run dev:frontend\" \"npm run dev:backend\"",
-    "dev:frontend": "vite",
-    "dev:backend": "node server/index.ts"
-  }
-}
-```
-
 ### 9.2 Production Deployment
 
-**Option A: Static hosting + separate backend**
-- Frontend: Vercel, Netlify, or Cloudflare Pages (static files)
-- Backend: Railway, Render, or Fly.io (Express server)
-- Map data: Embedded in frontend build (static files)
+**Recommended: Single server (Option B)**
 
-**Option B: Single server**
-- One server serves both frontend and backend
-- Express serves static files from `dist/` + API routes
+- Express server serves both static files (from `dist/`) and API routes
 - Deployed via Docker or direct to VPS
+- Simpler than separate frontend/backend hosting
+- Fewer moving parts
 
-**Recommended for V1:** Option B (simpler, fewer moving parts)
+**Deployment steps:**
+1. Run build scripts: `npm run build:map-data` (download + convert Overture tiles)
+2. Build frontend: `npm run build` (Vite produces `dist/`)
+3. Start server: `node server/index.ts` (serves `dist/` + API routes)
+
+**Alternative: Separate hosting**
+- Frontend: Vercel/Netlify (static files)
+- Backend: Railway/Render (Express server)
+- Map data: S3/CDN (glTF + GeoJSON files)
 
 ### 9.3 Environment Variables
 
@@ -971,13 +1004,13 @@ Environment:
 | `DARWIN_API_KEY` | Yes | Darwin DBRS API key |
 | `ADSBX_API_KEY` | Yes | ADSBx API key |
 | `AIS_HUB_USERNAME` | Yes | AIS Hub username |
-| `PORT` | No (default: 3001) | Backend server port |
+| `PORT` | No (default: 3001) | Server port |
 
 ### 9.4 Static Assets
 
 | Asset | Location | Generated By |
 |-------|----------|--------------|
-| Buildings GeoJSON | `public/map-data/buildings.geojson` | `scripts/download-map-data.ts` |
+| Buildings glTF | `public/map-data/buildings.glb` | `scripts/download-and-convert-buildings.ts` |
 | Geometry GeoJSON | `public/map-data/geometry.geojson` | `scripts/fetch-osm-geometry.ts` |
 | Built frontend | `dist/` | `vite build` |
 
@@ -991,35 +1024,35 @@ Environment:
 |-------|----------|
 | Storage | `.env.local` (gitignored), read via `process.env` |
 | Transmission | HTTPS only for all external API calls |
-| Frontend | Never exposed to browser — all API calls go through backend proxy |
+| Frontend | Never exposed — all API calls go through backend |
 | Logging | API keys are never logged or printed |
 
 ### 10.2 Secrets Management
 
-- **Development:** `.env.local` file (never committed)
+- **Development:** `.env.local` file
 - **Production:** Environment variables set by hosting platform
-- **No secret managers** (overkill for this project)
+- **No secret managers**
 
 ### 10.3 Input Validation
 
-All external API responses are validated before being stored:
+All external API responses validated before entering the Vehicle State Engine:
 
 ```typescript
-function validateVehicle(data: unknown): Vehicle | null {
+function validateEntity(data: unknown, type: VehicleType): TransportEntity | null {
   if (!data || typeof data !== 'object') return null;
   const obj = data as Record<string, unknown>;
 
   // Required fields
   if (typeof obj.lat !== 'number' || typeof obj.lng !== 'number') return null;
 
-  // Bounds check (Greater London)
+  // Bounds check (Greater London + buffer)
   if (obj.lat < 51.0 || obj.lat > 52.0 || obj.lng < -1.0 || obj.lng > 1.0) return null;
 
   // Type-specific validation
   if (type === 'plane' && (typeof obj.altitude !== 'number' || obj.altitude < 0)) return null;
   if (type === 'ship' && (typeof obj.speed !== 'number' || obj.speed < 0)) return null;
 
-  return mapToVehicle(obj, type);
+  return mapToEntity(obj, type);
 }
 ```
 
@@ -1027,10 +1060,10 @@ function validateVehicle(data: unknown): Vehicle | null {
 
 | Scenario | Behavior |
 |----------|----------|
-| API returns 5xx | Retry once, then return empty array (graceful degradation) |
-| API times out | Retry once, then return empty array |
-| API returns malformed JSON | Log error, return empty array |
-| API key invalid | Log error, show warning in console, return empty array |
+| API returns 5xx | Retry once, mark layer as 'error' |
+| API times out | Retry once, mark layer as 'error' |
+| API returns malformed JSON | Log error, skip that vehicle |
+| API key invalid | Log error, mark layer as 'error', stop polling for 60s |
 | Rate limit exceeded | Wait and retry, log warning |
 
 ---
@@ -1040,115 +1073,146 @@ function validateVehicle(data: unknown): Vehicle | null {
 ### 11.1 Logging
 
 **Backend:**
-- `console.log` for normal operations (data fetches, cache hits/misses)
-- `console.warn` for recoverable issues (stale data, missing fields)
-- `console.error` for failures (network errors, parse errors)
+- `[TFL] Fetched 247 stations in 340ms`
+- `[ADSBX] Fetched 42 aircraft in 1200ms`
+- `[EntityResolver] Matched 38/42 planes, created 4 new, removed 2 stale`
+- `[Inference] Bus N343: position 0.73 along route (ETA 95s)`
+- `[Heartbeat] WARNING: Train 9100GLVC_001 stale for 120s`
+- `[CircuitBreaker] TFL adapter marked as error after 3 failures`
 
 **Frontend:**
-- `console.log` for data updates (store changes)
-- `console.warn` for rendering issues (missing geometry, invalid positions)
-- `console.error` for crashes (Three.js errors, store corruption)
-
-**Log format:** Simple string messages with context prefix.
-```
-[TFL] Fetched 247 stations in 340ms
-[ADSBX] Fetched 42 aircraft in 1200ms
-[Cache] HIT tube: 30s remaining
-[Cache] MISS plane: fetching...
-[Inference] Bus N343: position 0.73 along route (ETA 95s)
-```
+- `[SSE] Connected, received 1042 vehicles`
+- `[SSE] Disconnected, reconnecting in 5s`
+- `[Layer] Bus layer status: stale (last update 45s ago)`
 
 ### 11.2 Metrics
 
-**V1 (no metrics collection):** No external monitoring. Performance is verified visually.
+**V1:** No external monitoring. Performance verified visually.
 
-**Future enhancement:** Add simple metrics:
-- API response times (p50, p95, p99)
-- Cache hit rate
-- Vehicle count per layer
-- Frame rate (FPS)
+**Future:** API response times, cache hit rate, vehicle count, frame rate.
 
 ### 11.3 Debugging Approach
 
-1. **Visual debugging:** Toggle layer visibility, zoom to specific areas, check vehicle positions
-2. **Console logging:** Backend logs show fetch times, cache status, errors
-3. **Store inspection:** `useStore.getState()` in browser console to inspect current state
-4. **Network tab:** Frontend Network tab shows API responses
-5. **DevTools:** React DevTools for component tree, Zustand middleware for store debugging
+1. **Visual debugging:** Toggle layers, zoom, check positions
+2. **Console logging:** Backend logs show fetch times, entity resolution, inference
+3. **SSE inspection:** Browser DevTools Network tab shows SSE events
+4. **Store inspection:** `useStore.getState()` in browser console
+5. **Ref inspection:** `vehiclesRef.current` in browser console (from Scene component)
 
 ---
 
-## 12. Architecture Decision Records (ADRs)
-
-The following decisions deserve formal ADRs:
+## 12. Architecture Decision Records
 
 ### ADR-001: Dummy-First Development
 - **Status:** Accepted
-- **Context:** API keys are required for all external data sources. Registration takes time. Rate limits constrain testing.
-- **Decision:** Build and test the entire frontend with dummy data. Real API integration is a drop-in replacement.
-- **Consequences:** Faster development iteration. Visual feedback immediately. API integration is a focused final phase.
+- **Context:** API keys required for all sources. Rate limits constrain testing.
+- **Decision:** Build and test entire frontend with dummy data. Real API integration is a drop-in replacement.
+- **Consequences:** Faster iteration. Visual feedback immediately.
 
-### ADR-002: Instanced Meshes for All Vehicles
+### ADR-002: Instanced Meshes for Vehicles
 - **Status:** Accepted
-- **Context:** 6 transport types with hundreds of vehicles. Individual meshes would cause thousands of draw calls.
-- **Decision:** One `InstancedMesh` per transport type. Per-instance colors via `setColorAt()`.
-- **Consequences:** ~6 draw calls for all vehicles. Minimal GPU load. Slightly less flexibility per vehicle (can't have unique materials).
+- **Context:** Hundreds of vehicles, need minimal draw calls.
+- **Decision:** One `InstancedMesh` per transport type.
+- **Consequences:** ~6 draw calls for all vehicles. Per-instance colors via `setColorAt()`.
 
 ### ADR-003: Geometry-Constrained Animation
 - **Status:** Accepted
-- **Context:** Buses and trains must appear on roads/tracks, not fly over buildings.
-- **Decision:** All vehicle positions are projected onto the nearest point of the road/rail geometry array.
-- **Consequences:** Vehicles always appear on correct paths. Requires OSM geometry data. More complex than free-space interpolation.
+- **Context:** Vehicles must appear on roads/tracks.
+- **Decision:** All positions projected onto nearest point of geometry array.
+- **Consequences:** Always correct visual placement. Requires OSM geometry.
 
-### ADR-004: Pre-processed Map Data
+### ADR-004: Draco-Compressed glTF for Buildings (REVISED from v1)
 - **Status:** Accepted
-- **Context:** Overture provides data as Parquet tiles. Parsing in the browser requires WASM.
-- **Decision:** Download and convert Parquet → GeoJSON at build time. Serve static GeoJSON files.
-- **Consequences:** Zero runtime parsing cost. Smaller browser bundle. Requires build script. Data can drift (Overture updates periodically).
+- **Context:** Static GeoJSON (400-800MB) will crash the browser. JSON.parse freezes main thread for 10-30s. Heap expansion 2-4x raw size.
+- **Decision:** Download Overture Parquet tiles, convert to single merged glTF with Draco compression at build time. Target <50MB compressed. Load via `useGLTF` from Drei.
+- **Consequences:** Zero JSON.parse overhead. Loads in ~2-3s. Three.js handles LOD/frustum internally. Requires build script with draco3d. Build script must be run locally (not in CI/CD) due to memory requirements.
+- **Build script location:** `scripts/download-and-convert-buildings.ts`
+- **Output:** `public/map-data/buildings.glb`
 
-### ADR-005: Polling Over WebSockets
+### ADR-005: Backend Aggregator, Not Proxy (REVISED from v1)
 - **Status:** Accepted
-- **Context:** External APIs are HTTP-based. No WebSocket endpoints available.
-- **Decision:** HTTP polling with configurable intervals. No WebSocket connections.
-- **Consequences:** Simpler architecture. Higher latency than push (but acceptable for this use case). More HTTP requests than necessary.
+- **Context:** Proxy model fails with 2+ users — each client triggers separate API calls, exhausting rate limits.
+- **Decision:** Backend polls APIs on its own schedule. Maintains canonical vehicle state. Broadcasts to all clients via SSE. One poll serves all users.
+- **Consequences:** Scales to unlimited clients without additional API calls. Adds complexity (SSE, state management, entity resolution). Backend must hold map geometry for inference.
 
-### ADR-006: Express Proxy Over Pure Frontend
+### ADR-006: SSE Over HTTP Polling (REVISED from v1)
 - **Status:** Accepted
-- **Context:** External APIs don't support CORS. API keys must not be exposed in browser.
-- **Decision:** Express proxy server handles all external API calls. Frontend calls proxy endpoints.
-- **Consequences:** Solves CORS and key exposure. Adds a server process. Slightly more complex dev setup.
+- **Context:** HTTP polling creates unnecessary requests. SSE is push-based, lighter.
+- **Decision:** Backend pushes vehicle snapshots via SSE. Frontend uses `EventSource`.
+- **Consequences:** Real-time updates. Automatic reconnection. Simpler frontend (no polling loop). Limited browser support (SSE supported in all modern browsers).
 
-### ADR-007: Bloom Post-Processing for Neon Glow
+### ADR-007: Mutable Refs for Vehicle Positions (NEW)
 - **Status:** Accepted
-- **Context:** Reference screenshots show glowing neon transport lines.
-- **Decision:** `UnrealBloomPass` from @react-three/postprocessing.
-- **Consequences:** Simple implementation. Looks great. One extra full-screen pass (~1-2ms on modern GPU).
+- **Context:** Updating 1000+ vehicles through Zustand every 10-30s triggers React re-renders of all components. Even with `useShallow`, the reconciliation cycle causes frame drops.
+- **Decision:** Vehicle positions stored in mutable refs. `useFrame` reads refs directly. Only UI state (hover, click, search) stored in Zustand.
+- **Consequences:** No React re-render on position updates. 60fps maintained. Slightly less "React-idiomatic" but necessary for performance.
 
-### ADR-008: TDD for Logic Layer Only
+### ADR-008: Unified Transport Schema (NEW)
 - **Status:** Accepted
-- **Context:** Project is mostly integration-heavy (3D rendering, API calls, UI). TDD on components is brittle.
-- **Decision:** TDD for pure logic modules (geo.ts, routeInterpolation.ts, cache.ts, inference.ts). Implement-and-test for components and API fetchers.
-- **Consequences:** Tests focus on what's testable and valuable. No brittle DOM/Three.js assertions. Faster test development.
+- **Context:** 5 external APIs with different response formats. Brittle — any field change breaks the frontend.
+- **Decision:** All adapters output the same `TransportEntity` shape. Frontend consumes only this schema.
+- **Consequences:** Frontend isolated from API changes. Adapter pattern makes provider swapping easy. Adds a normalization layer.
+
+### ADR-009: Entity Resolution Layer (NEW)
+- **Status:** Accepted
+- **Context:** Without stable identifiers, vehicles despawn/respawn every polling cycle. A train at Station A then Station B must be recognized as the same entity.
+- **Decision:** Backend Entity Resolver matches incoming vehicles to existing entities using stable IDs (icao24, mmsi, registration) or route+direction+time windows.
+- **Consequences:** Smooth vehicle transitions. No flickering. Adds complexity to the backend.
+
+### ADR-010: Inference Engine on Backend (REVISED from v1)
+- **Status:** Accepted
+- **Context:** Running inference on frontend wastes CPU across all clients. Backend has the geometry anyway.
+- **Decision:** Inference runs on backend. Frontend receives render-ready snapshots (x,y,z coordinates).
+- **Consequences:** Consistent data across all clients. Backend holds map geometry. Frontend is simpler (just renders).
+
+### ADR-011: Polling Over WebSockets
+- **Status:** Accepted
+- **Context:** External APIs are HTTP-based. No WebSocket endpoints.
+- **Decision:** HTTP polling (backend) + SSE (backend to frontend).
+- **Consequences:** Simpler than WebSockets. Acceptable latency.
+
+### ADR-012: Visual Distinction — GPS vs Inferred (NEW)
+- **Status:** Accepted
+- **Context:** Users may mistake inferred positions for precise GPS coordinates.
+- **Decision:** `dataCertainty: 'gps' | 'inferred'` field. GPS vehicles: solid glow. Inferred vehicles: dashed trail or slightly dimmer glow.
+- **Consequences:** Transparency about data quality. Slightly more complex rendering.
+
+### ADR-013: Single Server Deployment (REVISED from v1)
+- **Status:** Accepted
+- **Context:** Separate frontend/backend hosting adds complexity.
+- **Decision:** Express server serves static files + API routes. Single deployment target.
+- **Consequences:** Simpler ops. Fewer moving parts. Easier debugging.
+
+### ADR-014: Attribution Overlay (NEW)
+- **Status:** Accepted
+- **Context:** Overture, OSM, TfL have strict attribution requirements.
+- **Decision:** Persistent footer showing data source credits.
+- **Consequences:** Legal compliance. Minimal UI impact.
 
 ---
 
 ## 13. Assumptions
 
-1. **Overture tiles are available** for the Greater London bounding box. If not, we fall back to a smaller area.
-2. **Overpass API returns complete geometry** for all major roads, rail lines, and waterways in Greater London. Some minor routes may be missing.
-3. **TfL API keys are obtained** before API integration phase. Registration is free and instant.
-4. **ADSBx free tier provides sufficient coverage** for London airspace. If not, we may need to expand the bounding box radius.
-5. **AIS Hub provides Thames coverage.** If vessel density is low, we may need to expand the bounding box.
-6. **Three.js instanced meshes support per-instance colors** via `setColorAt()`. This is documented behavior but should be verified.
-7. **Web Mercator projection is accurate enough** for London-scale visualization. For km-scale distances, distortion is minimal.
+1. **Overture tiles exist** for Greater London. Spike tested with 1km² area before full download.
+2. **Overpass API returns complete geometry** for major roads, rail lines, waterways. Minor routes may be missing.
+3. **TfL API keys obtained** before API integration. Registration is free and instant.
+4. **ADSBx free tier provides sufficient coverage** for London airspace.
+5. **AIS Hub provides Thames coverage.**
+6. **Three.js instanced meshes support per-instance colors** via `setColorAt()`.
+7. **Web Mercator projection is accurate enough** for London-scale visualization.
+8. **Draco compression reduces building data to <50MB** for Greater London. Spike-tested.
+9. **SSE is supported** in all target browsers (Chrome, Firefox, Safari, Edge — all support EventSource).
+10. **Darwin DBRS credits are sufficient** for 30s polling of ~200 stations. Estimated ~200 calls/hour × 16 hours = 3,200 credits/day. Well within 100k limit.
+
+---
 
 ## 14. Open Questions
 
-1. **What if Overture tiles are too large?** Estimated 400-800MB. If this is unacceptable, we may need to tile and stream buildings.
-2. **Should we cache GeoJSON on the backend or serve directly from static files?** Currently planned as static files. Backend caching adds complexity.
-3. **What happens if a user has WebGL disabled?** We should detect this and show a fallback message.
-4. **Should street lamps be placed on all roads or just major roads?** Currently planned for major roads only (motorway, trunk, primary).
-5. **What is the minimum supported browser?** Three.js requires WebGL 1.0+. Chrome, Firefox, Safari, Edge should all work.
+1. **What if Draco compression doesn't achieve <50MB?** Fallback: split buildings into 4 zone files, lazy-load by camera position.
+2. **What is the minimum supported browser?** Three.js requires WebGL 1.0+. Chrome 56+, Firefox 51+, Safari 11+, Edge 16+.
+3. **Should street lamps be on all roads or just major roads?** Currently planned for major roads only.
+4. **How to handle OSM geometry validation?** Bus routes may be broken/incomplete. Need validation tooling. Spike-tested with real Overpass queries.
+5. **What if TfL arrivals data is insufficient for train placement?** Darwin provides more detail for National Rail. Tube trains are the hardest to place accurately. May need to simplify to station-dot visualization for some lines.
 
 ---
 
@@ -1156,20 +1220,25 @@ The following decisions deserve formal ADRs:
 
 | Term | Definition |
 |------|------------|
-| **ADSBx** | ADS-B Exchange, a global aircraft tracking network |
-| **AIS** | Automatic Identification System, for vessel tracking |
+| **ADSBx** | ADS-B Exchange, global aircraft tracking network |
+| **AIS** | Automatic Identification System, vessel tracking |
 | **Darwin DBRS** | National Rail's Departure Board Reporting System |
-| **EPSG:3857** | Web Mercator projection, used for lat/lng → X/Z conversion |
+| **Entity Resolver** | Backend component that matches incoming vehicles to existing tracked entities |
+| **EPSG:3857** | Web Mercator projection |
 | **GeoJSON** | JSON-based format for geographic data |
+| **glTF** | 3D asset format, supports Draco compression |
 | **InstancedMesh** | Three.js class for rendering many objects with one draw call |
-| **JAMCAM** | Transport for London's traffic camera system |
-| **LOD** | Level of Detail, rendering simplified geometry at distance |
-| **NaptocCode** | National Public Transport Access Code, used by Darwin |
-| **Overture Maps** | Open-source map data project by Meta, Apple, Mapbox, OpenStreetMap |
+| **JAMCAM** | TFL's traffic camera system |
+| **LOD** | Level of Detail |
+| **NaptocCode** | National Public Transport Access Code |
+| **Overture Maps** | Open-source map data project |
 | **Overpass API** | Read-only API for querying OpenStreetMap data |
-| **Parquet** | Columnar storage format, used by Overture for tile data |
-| **R3F** | React Three Fiber, declarative Three.js for React |
+| **Parquet** | Columnar storage format |
+| **R3F** | React Three Fiber |
+| **SSE** | Server-Sent Events |
 | **TfL** | Transport for London |
-| **UnrealBloomPass** | Three.js post-processing effect for glow |
+| **TransportEntity** | Unified schema for all transport data |
+| **UnrealBloomPass** | Three.js post-processing glow effect |
+| **Vehicle State Engine** | Backend component maintaining canonical vehicle state |
 | **Web Mercator** | Map projection used by most web maps |
 | **Zustand** | Lightweight React state management library |

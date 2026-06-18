@@ -413,3 +413,218 @@ Each entry includes the question, options considered, our choice, and rationale.
 3. **Input validation** — Bad coordinates or missing fields from APIs. Add validation during API integration phase.
 4. **Error handling** — API failures, corrupt data, network issues. Add retry logic and graceful degradation during API integration.
 5. **Deployment** — No production build/deploy plan yet. Address in Phase 15.
+
+---
+
+## Post-Review Alignment (Pass 2)
+
+Decisions made after incorporating 3 independent architecture reviews (Gemma 4 31B, Qwen 3.6 27B, ChatGPT).
+
+### Q35: Building Data Delivery — GeoJSON vs Draco glTF
+
+**Question:** How to deliver 400-800MB of Overture building data to the browser?
+
+**Reviewer consensus:** Static GeoJSON will crash the browser. JSON.parse freezes main thread for 10-30s. Heap expansion 2-4x raw size. 50k-100k buildings exceed practical InstancedMesh limits.
+
+**Decision:** Download Overture Parquet tiles, convert to single merged glTF with Draco compression at build time. Target <50MB compressed. Load via `useGLTF` from Drei. Three.js handles LOD and frustum culling internally.
+
+**Rationale:** All 3 reviewers flagged this as Critical. The browser cannot handle 800MB of JSON. Draco glTF is the minimum viable fix that keeps the stack simple.
+
+---
+
+### Q36: Backend Architecture — Proxy vs Aggregator
+
+**Question:** Should the backend be a proxy (forwarding client requests) or an aggregator (polling on its own schedule)?
+
+**Reviewer consensus:** Proxy model exhausts API rate limits with 2+ concurrent users. Each client triggers separate API calls.
+
+**Decision:** Backend is an Aggregator. It polls APIs on its own schedule, maintains canonical vehicle state via a Vehicle State Engine, and broadcasts to all clients via SSE (Server-Sent Events).
+
+**Rationale:** One poll serves all users. Rate limits are respected regardless of client count. SSE is push-based, lighter than HTTP polling.
+
+---
+
+### Q37: Vehicle Position Storage — Zustand vs Mutable Refs
+
+**Question:** Where should vehicle positions be stored?
+
+**Reviewer consensus:** Updating 1000+ vehicles through Zustand every 10-30s triggers React re-renders of all components. Even with `useShallow`, the reconciliation cycle causes frame drops.
+
+**Decision:** Vehicle positions stored in mutable refs. `useFrame` reads refs directly — no React re-render triggered. Only UI state (hover, click, search, layer toggles) stored in Zustand.
+
+**Rationale:** Reviewer 1: "React render cycle overhead." Reviewer 2: "Zustand store will thrash." The renderer should never care about polling cadence. Poll → update simulation state → interpolate locally → render snapshots.
+
+---
+
+### Q38: Inference Engine Location
+
+**Question:** Should the inference engine run on the backend or frontend?
+
+**Reviewer 3:** "The inference engine section is massively underestimated." TfL arrivals are station-centric, not train-graph. Darwin doesn't provide enough info for continuous train placement.
+
+**Decision:** Inference engine runs on the backend. Frontend receives render-ready snapshots (x,y,z coordinates). Backend holds map geometry.
+
+**Rationale:** Reviewer 1: "Move the Inference Engine to the backend." Consistent data across all clients. Frontend is simpler (just renders).
+
+---
+
+### Q39: Unified Transport Schema
+
+**Question:** How to handle 5 different external API response formats?
+
+**Reviewer 1:** "Brittle API Data Contracts. A single field change in the TfL API could break the entire transport layer."
+
+**Decision:** All adapters output the same `TransportEntity` shape. Frontend consumes only this schema. Adapter pattern makes provider swapping easy.
+
+**Rationale:** Frontend isolated from API changes. System resilience.
+
+---
+
+### Q40: Entity Resolution
+
+**Question:** How to handle vehicle identity across polling cycles?
+
+**Reviewer 3:** "Not discussed in the docs. Without stable identifiers you get despawn/respawn every polling cycle."
+
+**Decision:** Backend Entity Resolver matches incoming vehicles to existing entities using stable IDs (icao24, mmsi, registration) or route+direction+time windows.
+
+**Rationale:** Smooth vehicle transitions. No flickering.
+
+---
+
+### Q41: Visual Distinction — GPS vs Inferred
+
+**Question:** How to differentiate GPS-verified vs inferred positions?
+
+**Reviewer 1:** "Users may mistake an inferred position for a precise GPS coordinate."
+
+**Decision:** `dataCertainty: 'gps' | 'inferred'` field. GPS vehicles: solid glow. Inferred vehicles: slightly dimmer glow or dashed trail.
+
+**Rationale:** Transparency about data quality. Trust.
+
+---
+
+### Q42: Filter/Search for Vehicles
+
+**Question:** How to handle thousands of vehicles becoming a "noise cloud"?
+
+**Reviewer 1:** "No requirement for filtering by line or searching for specific vehicle IDs."
+
+**Decision:** Add SearchPanel component with search bar and filter results. Filter by transport type, line, route.
+
+**Rationale:** Transforms from passive art piece to functional tool.
+
+---
+
+### Q43: Attribution Overlay
+
+**Question:** How to comply with Overture, OSM, TfL attribution requirements?
+
+**Reviewer 1:** "Strict attribution requirements."
+
+**Decision:** Persistent footer showing data source credits.
+
+**Rationale:** Legal compliance. Minimal UI impact.
+
+---
+
+### Q44: Deployment Strategy
+
+**Question:** Where and how to deploy?
+
+**Reviewer 2:** "Pick a deployment platform now, not in Phase 15."
+
+**Decision:** Single server (Express serves static files + API routes). Deployed via Docker or direct to VPS. Simpler than separate hosting.
+
+**Rationale:** Fewer moving parts. Easier debugging.
+
+---
+
+### Q45: Darwin Credit Accounting
+
+**Question:** How to account for Darwin DBRS credit costs?
+
+**Reviewer 2:** "Unknown cost per call."
+
+**Decision:** Estimated ~200 calls/hour × 16 hours = 3,200 credits/day. Well within 100k daily limit. Monitored via Heartbeat Monitor.
+
+**Rationale:** No risk of credit exhaustion with current polling schedule.
+
+---
+
+### Q46: Build Pipeline for Map Data
+
+**Question:** How to handle Overture tile download + conversion in CI/CD?
+
+**Reviewer 1 & 2:** "Will likely fail in CI/CD due to memory limits and deployment size caps."
+
+**Decision:** Run build scripts locally (not in CI/CD). Output saved to `public/map-data/`. Committed to repo. Vite build references pre-built assets.
+
+**Rationale:** CI/CD memory limits are too low for Parquet → glTF conversion. Local build is the practical approach.
+
+---
+
+### Q47: Real API Integration Timing
+
+**Question:** Should real API integration be Phase 14 (last) or earlier?
+
+**Reviewer 2:** "Integrate real TfL API in Phase 6 (not Phase 14)."
+
+**Decision:** Keep dummy data for development. Integrate real APIs during Phase 14 but validate with real data during Phase 5-6 (inference engine testing).
+
+**Rationale:** Dummy data allows visual iteration. But inference logic must be tested with real data early. Hybrid approach: dummy for UI, real for inference validation.
+
+---
+
+### Q48: OSM Bus Route Data Quality
+
+**Question:** How to handle inconsistent OSM bus route data?
+
+**Reviewer 3:** "OSM bus route data quality varies wildly. Some routes are perfect; others are broken, incomplete, or disconnected."
+
+**Decision:** Spike-test Overpass queries early. Validate geometry. For broken routes, fall back to straight-line interpolation between stops.
+
+**Rationale:** Reality check on OSM data quality. Graceful degradation for incomplete data.
+
+---
+
+### Q49: Tube Train Placement Accuracy
+
+**Question:** How to place Tube trains accurately when TfL arrivals are station-centric?
+
+**Reviewer 3:** "Reconstructing actual train positions is much harder than the PRD implies."
+
+**Decision:** For lines with good OSM geometry, use ETA-based interpolation. For lines with poor geometry, fall back to station-dot visualization. Test with real TfL data early.
+
+**Rationale:** "The map isn't the hard part. Reality is." Tube train placement is the highest-risk inference task.
+
+---
+
+### Q50: Heartbeat Monitor
+
+**Question:** How to verify inferred positions are accurate?
+
+**Reviewer 1 & 2:** "No way to verify if 'Inferred' positions are accurate."
+
+**Decision:** Backend Heartbeat Monitor flags vehicles that haven't moved despite ETA changes. Logs warnings. Helps debug inference accuracy.
+
+**Rationale:** Data quality observability.
+
+---
+
+## Updated Score
+
+| Criteria | v1 Score | v2 Score | Change |
+|----------|----------|----------|--------|
+| Feasibility | 9/10 | 8.5/10 | -0.5 (inference complexity revealed) |
+| Data freshness | 9/10 | 9/10 | No change |
+| Visual fidelity | 9/10 | 9/10 | No change |
+| Complexity | 7/10 | 6/10 | -1 (more complexity revealed) |
+| Performance | 8/10 | 9/10 | +1 (mutable refs + Draco glTF fix critical issues) |
+| Scope clarity | 10/10 | 9/10 | -1 (inference uncertainty acknowledged) |
+
+**Overall v2: 8.5/10**
+
+**Key insight from reviewers:** "The biggest risk is not the UI, React, Three.js, Zustand, or performance. The biggest risk is: 'If I know where stations are and know where tracks are, I can know where trains are.' That sounds reasonable until you try implementing it."
+
+**Mitigation:** Spike-test inference engine with real TfL data during Phase 5. If inference fails, fall back to station-dot visualization. The map and UI remain functional regardless.
